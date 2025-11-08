@@ -1,3 +1,34 @@
 spring:
   application:
     name: moran-cloud-disk
+  datasource:
+    url: jdbc:mysql://localhost:3306/cloud_drive?useSSL=false&serverTimezone=UTC&allowPublicKeyRetrieval=true
+    username: root
+    password: root
+    driver-class-name: com.mysql.cj.jdbc.Driver
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: true
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.MySQLDialect
+  servlet:
+    multipart:
+      max-file-size: 500MB
+      max-request-size: 500MB
+  main:
+    allow-circular-references: true
+
+# 存储配置 (Win 本地路径测试)
+storage:
+  path: D:/data/uploads
+
+# JWT 配置
+jwt:
+  secret: your-super-secret-jwt-key-change-in-prod
+  expiration: 86400000
+
+# 配额默认10GB
+quota:
+  total: 10737418240
