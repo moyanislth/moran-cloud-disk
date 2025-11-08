@@ -1,0 +1,18 @@
+# IntelliJ IDEA
+.idea/
+*.iws
+*.ipr
+*.iml
+/out/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs & temp
+/logs/
+/tmp/
+/.cache/
+/.vscode/
+
+/*.log
