@@ -10,6 +10,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.IOException;
@@ -17,8 +18,11 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.Queue;
 import java.util.UUID;
 
 @Service
@@ -48,11 +52,27 @@ public class FileService {
 
     public List<MoranFile> listFiles(Long parentId) {
         Long userId = getCurrentUserId();
+        logger.info("Listing files for user {} in parent {}", userId, parentId);
         if (parentId == null) {
-            parentId = 0L;  // Root
+            List<MoranFile> files = fileRepository.findRootFilesByUserId(userId);
+            logger.info("Root files count for user {}: {}", userId, files.size());
+            return files;
+        } else {
+            List<MoranFile> files = fileRepository.findByUserIdAndParentIdOrderByNameAsc(userId, parentId);
+            logger.info("Sub files count for user {} parent {}: {}", userId, parentId, files.size());
+            return files;
         }
-        logger.debug("Listing files for user {} in parent {}", userId, parentId);
-        return fileRepository.findByUserIdAndParentIdOrderByNameAsc(userId, parentId);
+    }
+
+    public MoranFile getFileById(Long id) {
+        logger.debug("Getting file by ID: {}", id);
+        MoranFile file = fileRepository.findById(id).orElseThrow(() -> new RuntimeException("File not found: " + id));
+        Long userId = getCurrentUserId();
+        if (!file.getUser().getId().equals(userId)) {
+            logger.warn("Unauthorized access to file {} by user {}", id, userId);
+            throw new RuntimeException("Unauthorized access to file");
+        }
+        return file;
     }
 
     public MoranFile uploadFile(MultipartFile file, Long parentId) throws IOException {
@@ -64,18 +84,20 @@ public class FileService {
                 throw new RuntimeException("Storage quota exceeded");
             }
 
+            String fullPath = buildFullPath(parentId, null);
+            Path dirPath = Paths.get(storagePath, fullPath);
+            if (!Files.exists(dirPath)) {
+                Files.createDirectories(dirPath);
+                logger.info("Created upload dir: {}", dirPath);
+            }
             String uuid = UUID.randomUUID().toString();
             String fileExt = Optional.ofNullable(file.getOriginalFilename())
                     .filter(name -> name.contains("."))
                     .map(name -> name.substring(name.lastIndexOf(".")))
                     .orElse("");
-            String filePath = uuid + fileExt;
+            String filePath = fullPath + "/" + uuid + fileExt;
 
-            Path targetLocation = Paths.get(storagePath).resolve(filePath);
-            if (!Files.exists(Paths.get(storagePath))) {
-                Files.createDirectories(Paths.get(storagePath));
-                logger.info("Created storage dir: {}", storagePath);
-            }
+            Path targetLocation = Paths.get(storagePath, filePath);
             Files.copy(file.getInputStream(), targetLocation, StandardCopyOption.REPLACE_EXISTING);
             logger.debug("File saved to: {}", targetLocation);
 
@@ -85,7 +107,7 @@ public class FileService {
             moranFile.setSize(file.getSize());
             moranFile.setMimeType(file.getContentType());
             moranFile.setUser((User) SecurityContextHolder.getContext().getAuthentication().getPrincipal());
-            moranFile.setParentId(parentId != null ? parentId : null);
+            moranFile.setParentId(parentId);
 
             MoranFile saved = fileRepository.save(moranFile);
             quota.setUsedSpace(quota.getUsedSpace() + file.getSize());
@@ -101,17 +123,144 @@ public class FileService {
         }
     }
 
+    private String buildFullPath(Long parentId, String finalName) {
+        StringBuilder path = new StringBuilder();
+        Long current = parentId;
+        while (current != null) {
+            Optional<MoranFile> parent = fileRepository.findById(current);
+            if (parent.isPresent()) {
+                path.insert(0, "/" + parent.get().getName());
+                current = parent.get().getParentId();
+            } else {
+                current = null;
+            }
+        }
+        if (finalName != null) {
+            path.append("/" + finalName);
+        }
+        return path.toString();
+    }
+
     public MoranFile createFolder(String folderName, Long parentId) {
         logger.info("Creating folder: {} in parent {}", folderName, parentId);
+        String fullPath = buildFullPath(parentId, folderName);
+        Path targetDir = Paths.get(storagePath, fullPath);
+        try {
+            if (!Files.exists(targetDir)) {
+                Files.createDirectories(targetDir);
+                logger.info("Created folder dir: {}", targetDir);
+            }
+        } catch (IOException e) {
+            logger.error("Failed to create folder dir: {}", e.getMessage());
+        }
+
         MoranFile folder = new MoranFile();
         folder.setName(folderName);
-        folder.setPath(UUID.randomUUID().toString());  // Dummy path for folder
+        folder.setPath(fullPath + "/");  // dir end with /
         folder.setIsFolder(true);
         folder.setUser((User) SecurityContextHolder.getContext().getAuthentication().getPrincipal());
-        folder.setParentId(parentId != null ? parentId : null);
+        folder.setParentId(parentId);
+
         MoranFile saved = fileRepository.save(folder);
         logger.info("Folder created: ID {}", saved.getId());
         return saved;
+    }
+
+    /**
+     * Helper method to get all direct and indirect descendants of a folder (excluding self).
+     */
+    private List<MoranFile> getDescendants(Long folderId) {
+        List<MoranFile> descendants = new ArrayList<>();
+        Queue<Long> queue = new ArrayDeque<>();
+        queue.add(folderId);
+
+        Long userId = getCurrentUserId();
+        while (!queue.isEmpty()) {
+            Long currentId = queue.poll();
+            List<MoranFile> children = fileRepository.findByUserIdAndParentIdOrderByNameAsc(userId, currentId);
+            for (MoranFile child : children) {
+                descendants.add(child);
+                if (child.getIsFolder()) {
+                    queue.add(child.getId());
+                }
+            }
+        }
+        return descendants;
+    }
+
+    @Transactional
+    public MoranFile renameFile(Long id, String newName) {
+        logger.info("Renaming file ID {} to {}", id, newName);
+        MoranFile file = fileRepository.findById(id).orElseThrow(() -> new RuntimeException("File not found"));
+        Long userId = getCurrentUserId();
+        if (!file.getUser().getId().equals(userId)) {
+            throw new RuntimeException("Unauthorized");
+        }
+
+        // Prevent empty or invalid name
+        if (newName == null || newName.trim().isEmpty()) {
+            throw new RuntimeException("Invalid name");
+        }
+
+        String oldName = file.getName();
+        boolean isFolder = file.getIsFolder() != null && file.getIsFolder();
+        String oldSuffix = isFolder ? "/" : "";
+        String newSuffix = isFolder ? "/" : "";
+
+        // Build old and new base paths
+        String oldBasePath = buildFullPath(file.getParentId(), oldName) + oldSuffix;
+        String newBasePath = buildFullPath(file.getParentId(), newName) + newSuffix;
+
+        // Calculate old and new full paths for physical move
+        String oldFullPath = file.getPath(); // Already includes suffix for folders
+        String newFullPath;
+        if (file.getParentId() == null) {
+            // Root level
+            newFullPath = "/" + newName + newSuffix;
+        } else {
+            String parentPath = buildFullPath(file.getParentId(), null);
+            newFullPath = parentPath + "/" + newName + newSuffix;
+        }
+
+        // Physical move
+        Path oldPathObj = Paths.get(storagePath, oldFullPath);
+        Path newPathObj = Paths.get(storagePath, newFullPath);
+        try {
+            if (Files.exists(oldPathObj)) {
+                // For directories, Files.move will recursively move the entire tree
+                Files.move(oldPathObj, newPathObj, StandardCopyOption.REPLACE_EXISTING);
+                logger.info("Moved path from {} to {}", oldFullPath, newFullPath);
+            }
+        } catch (IOException e) {
+            logger.error("Failed to move path: {}", e.getMessage());
+            throw new RuntimeException("Failed to rename on disk: " + e.getMessage(), e);
+        }
+
+        // Update DB: self first
+        file.setName(newName);
+        file.setPath(newFullPath);
+        fileRepository.save(file);
+
+        // If folder, update all descendants' paths
+        if (isFolder) {
+            List<MoranFile> descendants = getDescendants(id);
+            for (MoranFile desc : descendants) {
+                String oldDescPath = desc.getPath();
+                // Compute relative path and rebuild
+                if (oldDescPath.startsWith(oldBasePath)) {
+                    String relativePath = oldDescPath.substring(oldBasePath.length());
+                    String newDescPath = newBasePath + relativePath;
+                    desc.setPath(newDescPath);
+                    fileRepository.save(desc);
+                    logger.debug("Updated descendant path: {} -> {}", oldDescPath, newDescPath);
+                }
+            }
+            logger.info("Updated {} descendant paths for renamed folder {}", descendants.size(), id);
+        }
+
+        MoranFile updated = file;
+        logger.info("Rename successful: ID {}", id);
+        return updated;
     }
 
     public byte[] downloadFile(Long id) throws IOException {
@@ -136,8 +285,17 @@ public class FileService {
         }
 
         if (file.getIsFolder()) {
-            // 简化：仅删空文件夹，后期递归
-            logger.warn("Folder delete not implemented fully for ID: {}", id);
+            Path dirPath = Paths.get(storagePath, file.getPath());
+            if (Files.exists(dirPath)) {
+                Files.walk(dirPath).sorted((p1, p2) -> -p1.compareTo(p2)).forEach(p -> {
+                    try {
+                        Files.delete(p);
+                    } catch (IOException e) {
+                        logger.error("Failed to delete path: {}", p, e);
+                    }
+                });
+            }
+            logger.warn("Folder and contents deleted for ID: {}", id);
         } else {
             Quota quota = quotaRepository.findById(1L).orElseThrow(() -> new RuntimeException("Quota not found"));
             quota.setUsedSpace(Math.max(0, quota.getUsedSpace() - file.getSize()));
@@ -149,21 +307,23 @@ public class FileService {
         logger.info("Delete successful: ID {}", id);
     }
 
-    public MoranFile renameFile(Long id, String newName) {
-        logger.info("Renaming file ID {} to {}", id, newName);
-        MoranFile file = fileRepository.findById(id).orElseThrow(() -> new RuntimeException("File not found"));
-        Long userId = getCurrentUserId();
-        if (!file.getUser().getId().equals(userId)) {
-            throw new RuntimeException("Unauthorized");
-        }
-        file.setName(newName);
-        MoranFile updated = fileRepository.save(file);
-        logger.info("Rename successful: ID {}", id);
-        return updated;
-    }
-
     public Quota getQuota() {
         logger.debug("Fetching quota");
         return quotaRepository.findById(1L).orElse(new Quota());
+    }
+
+    public List<MoranFile> getPathChain(Long id) {
+        List<MoranFile> chain = new ArrayList<>();
+        Long current = id;
+        while (current != null) {
+            MoranFile parent = fileRepository.findById(current).orElse(null);
+            if (parent != null) {
+                chain.add(0, parent);
+                current = parent.getParentId();
+            } else {
+                current = null;
+            }
+        }
+        return chain;
     }
 }

@@ -1,47 +1,75 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { DataGrid } from '@mui/x-data-grid';
 import { useDropzone } from 'react-dropzone';
-import { Container, Button, Dialog, DialogTitle, DialogContent, TextField, Alert, Typography, Link, CircularProgress } from '@mui/material';
-import { useAuth } from '../hooks/useAuth';  // 从 AuthContext 获取 user，确保 query enabled
+import { Container, Button, Dialog, DialogTitle, DialogContent, TextField, Alert, Typography, Link, CircularProgress, IconButton } from '@mui/material';
+import RefreshIcon from '@mui/icons-material/Refresh';
+import { useAuth } from '../hooks/useAuth';
 import { axiosInstance } from '../utils/api';
 
-function FileList() {
-  const { user } = useAuth();  // 确保登录后 query
+function FileList({ parentId: propParentId, onFolderClick }) {
+  const { user } = useAuth();
   const queryClient = useQueryClient();
-  const [parentId, setParentId] = useState(null);
+  const [parentId, setParentId] = useState(propParentId || null);
+  const [queryVersion, setQueryVersion] = useState(0);
   const [openDialog, setOpenDialog] = useState(false);
   const [newName, setNewName] = useState('');
   const [selectedId, setSelectedId] = useState(null);
   const [error, setError] = useState('');
 
-  const { data: files = [], isLoading } = useQuery({
-    queryKey: ['files', parentId],
-    queryFn: () => axiosInstance.get(`/files?parentId=${parentId || ''}`).then(res => res.data),
-    enabled: !!user,  // 登录后才 query，减少无谓调用
-    staleTime: 0  // 立即 stale，确保 refetch 有效
+  useEffect(() => {
+    setParentId(propParentId || null);
+  }, [propParentId]);
+
+  useEffect(() => {
+    if (parentId !== undefined) {
+      queryClient.invalidateQueries({ queryKey: ['files'] });
+      setQueryVersion(prev => prev + 1);
+    }
+  }, [parentId, queryClient]);
+
+  const { data: files = [], refetch, isLoading } = useQuery({
+    queryKey: ['files', parentId, queryVersion, user?.token],
+    queryFn: async () => {
+      const url = `/files?parentId=${parentId || ''}`;
+      const res = await axiosInstance.get(url);
+      console.log('Query files response:', res.data.length, 'items for parentId:', parentId);
+      return res.data;
+    },
+    enabled: !!user && !!user.token,
+    staleTime: 0,
+    refetchOnWindowFocus: false
   });
 
   const { data: quota } = useQuery({
-    queryKey: ['quota'],
+    queryKey: ['quota', user?.token],
     queryFn: () => axiosInstance.get('/files/quota').then(res => res.data),
-    enabled: !!user
+    enabled: !!user && !!user.token
   });
 
   const uploadMutation = useMutation({
     mutationFn: async (file) => {
+      if (!user?.token) throw new Error('No token, please login');
       const formData = new FormData();
       formData.append('file', file);
-      await axiosInstance.post('/files/upload', formData, {
-        params: { parentId: parentId || undefined },
-        headers: { 'Content-Type': 'multipart/form-data' },
-        timeout: 30000
-      });
+      const url = '/files/upload';
+      const config = {
+        timeout: 30000,
+        headers: {
+          'Content-Type': undefined  // 强制 auto multipart, 覆盖任何 base
+        }
+      };
+      if (parentId) {
+        config.params = { parentId };
+      }
+      const res = await axiosInstance.post(url, formData, config);
+      return res;
     },
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['files', parentId] });  // 强制 invalidate + refetch
-      queryClient.invalidateQueries({ queryKey: ['quota'] });  // 刷新 quota
-      setError('');  // 清错误
+      setQueryVersion(prev => prev + 1);
+      queryClient.invalidateQueries({ queryKey: ['quota'] });
+      refetch();
+      setError('');
     },
     onError: (err) => {
       console.error('Upload error:', err);
@@ -50,17 +78,29 @@ function FileList() {
   });
 
   const onDrop = (acceptedFiles) => {
-    setError('');  // 清旧错误
-    acceptedFiles.forEach((file) => {
-      uploadMutation.mutate(file);  // mutation 处理，避免循环
-    });
+    if (!user?.token) {
+      setError('请先登录');
+      return;
+    }
+    setError('');
+    acceptedFiles.forEach((file) => uploadMutation.mutate(file));
   };
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({ 
     onDrop, 
     multiple: true,
-    disabled: uploadMutation.isPending  // 上传中禁用 drop
+    disabled: uploadMutation.isPending || !user?.token
   });
+
+  const manualRefetch = () => {
+    refetch();
+    queryClient.invalidateQueries({ queryKey: ['quota'] });
+  };
+
+  const handleFolderClick = (id) => {
+    setParentId(id);
+    if (onFolderClick) onFolderClick(id);
+  };
 
   const columns = [
     { field: 'id', headerName: 'ID', width: 70 },
@@ -69,9 +109,9 @@ function FileList() {
       headerName: '名称', 
       width: 300, 
       renderCell: (params) => (
-        <Link href={params.row.isFolder ? `/dashboard/folder/${params.row.id}` : `#`} onClick={(e) => {
+        <Link href={params.row.isFolder ? `/dashboard/folder/${params.row.id}` : '#'} onClick={(e) => {
           if (params.row.isFolder) {
-            setParentId(params.row.id);
+            handleFolderClick(params.row.id);
           }
           e.preventDefault();
         }}>
@@ -79,8 +119,25 @@ function FileList() {
         </Link>
       )
     },
-    { field: 'size', headerName: '大小', width: 130, valueFormatter: (params) => params.value ? (params.value / 1024 / 1024).toFixed(2) + ' MB' : '-' },
-    { field: 'uploadTime', headerName: '修改时间', width: 200, type: 'dateTime' },
+    { 
+      field: 'size', 
+      headerName: '大小', 
+      width: 130, 
+      valueFormatter: (params) => {
+        if (!params || params.value === null || params.value === undefined) return '-';
+        return (params.value / 1024 / 1024).toFixed(2) + ' MB';
+      }
+    },
+    { 
+      field: 'uploadTime', 
+      headerName: '修改时间', 
+      width: 200, 
+      type: 'dateTime',
+      valueGetter: (params) => {
+        if (!params || !params.value) return null;
+        return new Date(params.value);
+      }
+    },
     {
       field: 'actions',
       headerName: '操作',
@@ -105,8 +162,9 @@ function FileList() {
   const deleteMutation = useMutation({
     mutationFn: (id) => axiosInstance.delete(`/files/${id}`),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['files', parentId] });
+      setQueryVersion(prev => prev + 1);
       queryClient.invalidateQueries({ queryKey: ['quota'] });
+      refetch();
     },
     onError: () => setError('删除失败')
   });
@@ -121,7 +179,8 @@ function FileList() {
     mutationFn: (data) => axiosInstance.put(`/files/${data.id}/rename`, { newName: data.name }),
     onSuccess: () => {
       setOpenDialog(false);
-      queryClient.invalidateQueries({ queryKey: ['files', parentId] });
+      setQueryVersion(prev => prev + 1);
+      refetch();
     },
     onError: () => setError('重命名失败')
   });
@@ -133,7 +192,8 @@ function FileList() {
   const createFolderMutation = useMutation({
     mutationFn: (name) => axiosInstance.post('/files/folder', { name, parentId }),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['files', parentId] });
+      setQueryVersion(prev => prev + 1);
+      refetch();
     },
     onError: () => setError('创建文件夹失败')
   });
@@ -145,6 +205,8 @@ function FileList() {
     }
   };
 
+  console.log('Debug - Current parentId:', parentId, 'Files length:', files.length, 'Query version:', queryVersion, 'Token:', user?.token ? 'present' : 'missing');
+
   return (
     <Container sx={{ p: 2 }}>
       {error && <Alert severity="error" onClose={() => setError('')}>{error}</Alert>}
@@ -154,9 +216,15 @@ function FileList() {
         {uploadMutation.isPending && <CircularProgress size={24} />}
         {uploadMutation.isPending && <Typography variant="body2">上传中...</Typography>}
       </div>
-      <Button onClick={createFolder} variant="outlined" sx={{ mb: 2 }} disabled={createFolderMutation.isPending}>
-        新建文件夹
-      </Button>
+      <div sx={{ display: 'flex', alignItems: 'center', mb: 2 }}>
+        <Button onClick={createFolder} variant="outlined" disabled={createFolderMutation.isPending || !user?.token}>
+          新建文件夹
+        </Button>
+        <IconButton onClick={manualRefetch} sx={{ ml: 1 }}>
+          <RefreshIcon />
+        </IconButton>
+        <Typography variant="body2" sx={{ ml: 1 }}>手动刷新</Typography>
+      </div>
       {quota && (
         <Typography>已用: {(quota.usedSpace / quota.totalSpace * 100).toFixed(1)}%</Typography>
       )}
