@@ -32,7 +32,7 @@ public class FileController {
 
     @PostMapping("/upload")
     @PreAuthorize("hasRole('ADMIN')")
-    public ResponseEntity<MoranFile> upload(@RequestParam("file") MultipartFile file,  // @RequestParam 兼容 query + multipart
+    public ResponseEntity<MoranFile> upload(@RequestParam("file") MultipartFile file,
                                             @RequestParam(required = false) Long parentId) throws IOException {
         MoranFile saved = fileService.uploadFile(file, parentId);
         return ResponseEntity.ok(saved);
@@ -56,6 +56,22 @@ public class FileController {
                 .body(resource);
     }
 
+    @GetMapping("/{id}/preview")
+    @PreAuthorize("hasRole('ADMIN')")
+    public ResponseEntity<ByteArrayResource> preview(@PathVariable Long id) throws IOException {
+        MoranFile file = fileService.getFileById(id);
+        if (file.getIsFolder()) {
+            throw new RuntimeException("Cannot preview folder");
+        }
+        byte[] data = fileService.downloadFile(id);
+        ByteArrayResource resource = new ByteArrayResource(data);
+        String mimeType = file.getMimeType();
+        return ResponseEntity.ok()
+                .header(HttpHeaders.CONTENT_DISPOSITION, "inline; filename=\"" + file.getName() + "\"")
+                .contentType(MediaType.parseMediaType(mimeType != null ? mimeType : MediaType.APPLICATION_OCTET_STREAM_VALUE))
+                .body(resource);
+    }
+
     @DeleteMapping("/{id}")
     @PreAuthorize("hasRole('ADMIN')")
     public ResponseEntity<?> delete(@PathVariable Long id) throws IOException {
@@ -76,10 +92,15 @@ public class FileController {
         return ResponseEntity.ok(fileService.getQuota());
     }
 
+    @GetMapping("/path/{id}")
+    @PreAuthorize("hasRole('ADMIN')")
+    public ResponseEntity<List<MoranFile>> getPathChain(@PathVariable Long id) {
+        List<MoranFile> chain = fileService.getPathChain(id);
+        return ResponseEntity.ok(chain);
+    }
     static class CreateFolderRequest {
         private String name;
         private Long parentId;
-        // Getters/Setters
         public String getName() { return name; }
         public void setName(String name) { this.name = name; }
         public Long getParentId() { return parentId; }
@@ -88,7 +109,6 @@ public class FileController {
 
     static class RenameRequest {
         private String newName;
-        // Getter/Setter
         public String getNewName() { return newName; }
         public void setNewName(String newName) { this.newName = newName; }
     }

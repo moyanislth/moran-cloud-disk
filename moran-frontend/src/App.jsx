@@ -11,23 +11,30 @@ function App() {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    const token = localStorage.getItem('token') || (() => {
+    let token = localStorage.getItem('token');
+    if (!token) {
       const cookieValue = document.cookie.split('; ').find(row => row.startsWith('jwt='));
-      return cookieValue ? cookieValue.split('=')[1] : null;
-    })();
+      token = cookieValue ? cookieValue.split('=')[1] : null;
+    }
+    console.log('App init token:', token ? 'found' : 'none');  // Debug token
     if (token) {
       axiosInstance.defaults.headers.common['Authorization'] = `Bearer ${token}`;
-      setUser({ token });  // 简化，实际fetch user
+      setUser({ token });
     }
     setLoading(false);
   }, []);
 
   const login = (token, rememberMe) => {
+    console.log('Login set token:', token ? 'success' : 'fail');  // Debug
     setUser({ token });
     axiosInstance.defaults.headers.common['Authorization'] = `Bearer ${token}`;
     if (rememberMe) {
       localStorage.setItem('token', token);
       document.cookie = `jwt=${token}; max-age=${7*24*60*60}; path=/`;
+    } else {
+      // 非记住我，仅 session
+      localStorage.removeItem('token');
+      document.cookie = `jwt=${token}; path=/`;  // 无 max-age，session 过期
     }
   };
 

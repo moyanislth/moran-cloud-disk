@@ -20,9 +20,9 @@ spring:
   main:
     allow-circular-references: true
 
-# 存储配置 (Win 本地路径测试)
+# 存储配置
 storage:
-  path: D:/data/uploads
+  path: D:/data/uploads  # 根目录
 
 # JWT 配置
 jwt:

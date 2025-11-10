@@ -17,6 +17,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -48,11 +49,27 @@ public class FileService {
 
     public List<MoranFile> listFiles(Long parentId) {
         Long userId = getCurrentUserId();
+        logger.info("Listing files for user {} in parent {}", userId, parentId);
         if (parentId == null) {
-            parentId = 0L;  // Root
+            List<MoranFile> files = fileRepository.findRootFilesByUserId(userId);
+            logger.info("Root files count for user {}: {}", userId, files.size());
+            return files;
+        } else {
+            List<MoranFile> files = fileRepository.findByUserIdAndParentIdOrderByNameAsc(userId, parentId);
+            logger.info("Sub files count for user {} parent {}: {}", userId, parentId, files.size());
+            return files;
         }
-        logger.debug("Listing files for user {} in parent {}", userId, parentId);
-        return fileRepository.findByUserIdAndParentIdOrderByNameAsc(userId, parentId);
+    }
+
+    public MoranFile getFileById(Long id) {
+        logger.debug("Getting file by ID: {}", id);
+        MoranFile file = fileRepository.findById(id).orElseThrow(() -> new RuntimeException("File not found: " + id));
+        Long userId = getCurrentUserId();
+        if (!file.getUser().getId().equals(userId)) {
+            logger.warn("Unauthorized access to file {} by user {}", id, userId);
+            throw new RuntimeException("Unauthorized access to file");
+        }
+        return file;
     }
 
     public MoranFile uploadFile(MultipartFile file, Long parentId) throws IOException {
@@ -64,18 +81,20 @@ public class FileService {
                 throw new RuntimeException("Storage quota exceeded");
             }
 
+            String fullPath = buildFullPath(parentId, null);
+            Path dirPath = Paths.get(storagePath, fullPath);
+            if (!Files.exists(dirPath)) {
+                Files.createDirectories(dirPath);
+                logger.info("Created upload dir: {}", dirPath);
+            }
             String uuid = UUID.randomUUID().toString();
             String fileExt = Optional.ofNullable(file.getOriginalFilename())
                     .filter(name -> name.contains("."))
                     .map(name -> name.substring(name.lastIndexOf(".")))
                     .orElse("");
-            String filePath = uuid + fileExt;
+            String filePath = fullPath + "/" + uuid + fileExt;
 
-            Path targetLocation = Paths.get(storagePath).resolve(filePath);
-            if (!Files.exists(Paths.get(storagePath))) {
-                Files.createDirectories(Paths.get(storagePath));
-                logger.info("Created storage dir: {}", storagePath);
-            }
+            Path targetLocation = Paths.get(storagePath, filePath);
             Files.copy(file.getInputStream(), targetLocation, StandardCopyOption.REPLACE_EXISTING);
             logger.debug("File saved to: {}", targetLocation);
 
@@ -85,7 +104,7 @@ public class FileService {
             moranFile.setSize(file.getSize());
             moranFile.setMimeType(file.getContentType());
             moranFile.setUser((User) SecurityContextHolder.getContext().getAuthentication().getPrincipal());
-            moranFile.setParentId(parentId != null ? parentId : null);
+            moranFile.setParentId(parentId);
 
             MoranFile saved = fileRepository.save(moranFile);
             quota.setUsedSpace(quota.getUsedSpace() + file.getSize());
@@ -101,17 +120,76 @@ public class FileService {
         }
     }
 
+    private String buildFullPath(Long parentId, String finalName) {
+        StringBuilder path = new StringBuilder();
+        Long current = parentId;
+        while (current != null) {
+            Optional<MoranFile> parent = fileRepository.findById(current);
+            if (parent.isPresent()) {
+                path.insert(0, "/" + parent.get().getName());
+                current = parent.get().getParentId();
+            } else {
+                current = null;
+            }
+        }
+        if (finalName != null) {
+            path.append("/" + finalName);
+        }
+        return path.toString();
+    }
+
     public MoranFile createFolder(String folderName, Long parentId) {
         logger.info("Creating folder: {} in parent {}", folderName, parentId);
+        String fullPath = buildFullPath(parentId, folderName);
+        Path targetDir = Paths.get(storagePath, fullPath);
+        try {
+            if (!Files.exists(targetDir)) {
+                Files.createDirectories(targetDir);
+                logger.info("Created folder dir: {}", targetDir);
+            }
+        } catch (IOException e) {
+            logger.error("Failed to create folder dir: {}", e.getMessage());
+        }
+
         MoranFile folder = new MoranFile();
         folder.setName(folderName);
-        folder.setPath(UUID.randomUUID().toString());  // Dummy path for folder
+        folder.setPath(fullPath + "/");  // dir end with /
         folder.setIsFolder(true);
         folder.setUser((User) SecurityContextHolder.getContext().getAuthentication().getPrincipal());
-        folder.setParentId(parentId != null ? parentId : null);
+        folder.setParentId(parentId);
+
         MoranFile saved = fileRepository.save(folder);
         logger.info("Folder created: ID {}", saved.getId());
         return saved;
+    }
+
+    public MoranFile renameFile(Long id, String newName) {
+        logger.info("Renaming file ID {} to {}", id, newName);
+        MoranFile file = fileRepository.findById(id).orElseThrow(() -> new RuntimeException("File not found"));
+        Long userId = getCurrentUserId();
+        if (!file.getUser().getId().equals(userId)) {
+            throw new RuntimeException("Unauthorized");
+        }
+
+        String oldPath = file.getPath();
+        String oldDir = oldPath.substring(0, oldPath.lastIndexOf('/'));
+        String newPath = oldDir + "/" + newName + (file.getIsFolder() ? "/" : "");
+        Path oldPathObj = Paths.get(storagePath, oldPath);
+        Path newPathObj = Paths.get(storagePath, newPath);
+        try {
+            if (Files.exists(oldPathObj)) {
+                Files.move(oldPathObj, newPathObj, StandardCopyOption.REPLACE_EXISTING);
+                logger.info("Moved path from {} to {}", oldPath, newPath);
+            }
+        } catch (IOException e) {
+            logger.error("Failed to move path: {}", e.getMessage());
+        }
+
+        file.setName(newName);
+        file.setPath(newPath);
+        MoranFile updated = fileRepository.save(file);
+        logger.info("Rename successful: ID {}", id);
+        return updated;
     }
 
     public byte[] downloadFile(Long id) throws IOException {
@@ -136,8 +214,17 @@ public class FileService {
         }
 
         if (file.getIsFolder()) {
-            // 简化：仅删空文件夹，后期递归
-            logger.warn("Folder delete not implemented fully for ID: {}", id);
+            Path dirPath = Paths.get(storagePath, file.getPath());
+            if (Files.exists(dirPath)) {
+                Files.walk(dirPath).sorted((p1, p2) -> -p1.compareTo(p2)).forEach(p -> {
+                    try {
+                        Files.delete(p);
+                    } catch (IOException e) {
+                        logger.error("Failed to delete path: {}", p, e);
+                    }
+                });
+            }
+            logger.warn("Folder and contents deleted for ID: {}", id);
         } else {
             Quota quota = quotaRepository.findById(1L).orElseThrow(() -> new RuntimeException("Quota not found"));
             quota.setUsedSpace(Math.max(0, quota.getUsedSpace() - file.getSize()));
@@ -149,21 +236,23 @@ public class FileService {
         logger.info("Delete successful: ID {}", id);
     }
 
-    public MoranFile renameFile(Long id, String newName) {
-        logger.info("Renaming file ID {} to {}", id, newName);
-        MoranFile file = fileRepository.findById(id).orElseThrow(() -> new RuntimeException("File not found"));
-        Long userId = getCurrentUserId();
-        if (!file.getUser().getId().equals(userId)) {
-            throw new RuntimeException("Unauthorized");
-        }
-        file.setName(newName);
-        MoranFile updated = fileRepository.save(file);
-        logger.info("Rename successful: ID {}", id);
-        return updated;
-    }
-
     public Quota getQuota() {
         logger.debug("Fetching quota");
         return quotaRepository.findById(1L).orElse(new Quota());
+    }
+
+    public List<MoranFile> getPathChain(Long id) {
+        List<MoranFile> chain = new ArrayList<>();
+        Long current = id;
+        while (current != null) {
+            MoranFile parent = fileRepository.findById(current).orElse(null);
+            if (parent != null) {
+                chain.add(0, parent);
+                current = parent.getParentId();
+            } else {
+                current = null;
+            }
+        }
+        return chain;
     }
 }
