@@ -2,8 +2,9 @@ import React, { useState, useEffect } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { DataGrid } from '@mui/x-data-grid';
 import { useDropzone } from 'react-dropzone';
-import { Container, Button, Dialog, DialogTitle, DialogContent, TextField, Alert, Typography, Link, CircularProgress, IconButton } from '@mui/material';
+import { Container, Button, Dialog, DialogTitle, DialogContent, TextField, Alert, Typography, Link, CircularProgress, IconButton, Chip, Box } from '@mui/material';
 import RefreshIcon from '@mui/icons-material/Refresh';
+import DeleteIcon from '@mui/icons-material/Delete';
 import { useAuth } from '../hooks/useAuth';
 import { axiosInstance } from '../utils/api';
 
@@ -34,6 +35,7 @@ function FileList({ parentId: propParentId, onFolderClick }) {
       const url = `/files?parentId=${parentId || ''}`;
       const res = await axiosInstance.get(url);
       console.log('Query files response:', res.data.length, 'items for parentId:', parentId);
+      console.log('Files data with lost flag:', res.data.map(f => ({ id: f.id, name: f.name, lost: f.lost, deleted: f.deleted })));  // Debug log
       return res.data;
     },
     enabled: !!user && !!user.token,
@@ -102,22 +104,46 @@ function FileList({ parentId: propParentId, onFolderClick }) {
     if (onFolderClick) onFolderClick(id);
   };
 
+  // Preprocess rows for lost files
+  const processedRows = files.map(file => ({
+    ...file,
+    isLost: file.lost || file.size === 0,
+    rowSx: { opacity: (file.lost || file.size === 0) ? 0.5 : 1 }
+  }));
+
   const columns = [
     { field: 'id', headerName: 'ID', width: 70 },
     { 
       field: 'name', 
       headerName: '名称', 
       width: 300, 
-      renderCell: (params) => (
-        <Link href={params.row.isFolder ? `/dashboard/folder/${params.row.id}` : '#'} onClick={(e) => {
-          if (params.row.isFolder) {
-            handleFolderClick(params.row.id);
-          }
-          e.preventDefault();
-        }}>
-          {params.row.isFolder ? '[文件夹]' : ''}{params.value}
-        </Link>
-      )
+      renderCell: (params) => {
+        const isLost = params.row.isLost;
+        return (
+          <Box sx={{ display: 'flex', alignItems: 'center' }}>
+            <Link 
+              href={params.row.isFolder ? `/dashboard/folder/${params.row.id}` : '#'} 
+              onClick={(e) => {
+                if (params.row.isFolder && !isLost) {
+                  handleFolderClick(params.row.id);
+                }
+                e.preventDefault();
+              }}
+              sx={{ opacity: isLost ? 0.5 : 1, cursor: isLost ? 'not-allowed' : 'pointer' }}
+            >
+              {params.row.isFolder ? '[文件夹]' : ''}{params.value}
+            </Link>
+            {isLost && (
+              <Chip 
+                label="已丢失" 
+                size="small" 
+                color="error" 
+                sx={{ ml: 1 }} 
+              />
+            )}
+          </Box>
+        );
+      }
     },
     { 
       field: 'size', 
@@ -142,13 +168,39 @@ function FileList({ parentId: propParentId, onFolderClick }) {
       field: 'actions',
       headerName: '操作',
       width: 200,
-      renderCell: (params) => (
-        <>
-          <Button size="small" onClick={() => downloadFile(params.row.id)}>下载</Button>
-          <Button size="small" onClick={() => { setSelectedId(params.row.id); setOpenDialog(true); setNewName(params.row.name); }}>重命名</Button>
-          <Button size="small" color="error" onClick={() => deleteFile(params.row.id)}>删除</Button>
-        </>
-      )
+      renderCell: (params) => {
+        const isLost = params.row.isLost;
+        const isAdmin = true;  // MVP 单用户，默认 admin，移除 role check
+        return (
+          <>
+            {!isLost && (
+              <>
+                <Button size="small" onClick={() => downloadFile(params.row.id)} disabled={isLost}>
+                  下载
+                </Button>
+                <Button 
+                  size="small" 
+                  onClick={() => { setSelectedId(params.row.id); setOpenDialog(true); setNewName(params.row.name); }} 
+                  disabled={isLost}
+                >
+                  重命名
+                </Button>
+              </>
+            )}
+            {isAdmin && (
+              <IconButton 
+                size="small" 
+                color="error" 
+                onClick={() => deleteFile(params.row.id)} 
+                disabled={!isAdmin}
+                title={isLost ? '清理丢失记录' : '删除'}
+              >
+                <DeleteIcon />
+              </IconButton>
+            )}
+          </>
+        );
+      }
     }
   ];
 
@@ -170,7 +222,12 @@ function FileList({ parentId: propParentId, onFolderClick }) {
   });
 
   const deleteFile = (id) => {
-    if (window.confirm('确认删除?')) {
+    const file = files.find(f => f.id === id);
+    const isLost = file?.lost || file?.size === 0;
+    const message = isLost 
+      ? '确认直接删除已丢失文件记录？（仅清理数据库，扣除配额）' 
+      : '确认删除正常文件？（物理删除服务器文件 + 清理数据库 + 扣除配额）';
+    if (window.confirm(message)) {
       deleteMutation.mutate(id);
     }
   };
@@ -195,7 +252,11 @@ function FileList({ parentId: propParentId, onFolderClick }) {
       setQueryVersion(prev => prev + 1);
       refetch();
     },
-    onError: () => setError('创建文件夹失败')
+    onError: (err) => {
+      setError('创建文件夹失败');
+      refetch();
+      queryClient.invalidateQueries({ queryKey: ['files', parentId] });
+    }
   });
 
   const createFolder = () => {
@@ -206,6 +267,7 @@ function FileList({ parentId: propParentId, onFolderClick }) {
   };
 
   console.log('Debug - Current parentId:', parentId, 'Files length:', files.length, 'Query version:', queryVersion, 'Token:', user?.token ? 'present' : 'missing');
+  console.log('User role:', user?.role);  // Debug role
 
   return (
     <Container sx={{ p: 2 }}>
@@ -231,7 +293,19 @@ function FileList({ parentId: propParentId, onFolderClick }) {
       {(isLoading || uploadMutation.isPending) ? (
         <CircularProgress />
       ) : (
-        <DataGrid rows={files} columns={columns} pageSize={10} checkboxSelection={false} loading={isLoading} />
+        <DataGrid 
+          rows={processedRows} 
+          columns={columns} 
+          pageSize={10} 
+          checkboxSelection={false} 
+          loading={isLoading}
+          getRowClassName={(params) => params.row.isLost ? 'lost-row' : ''}
+          sx={{
+            '& .lost-row': {
+              opacity: 0.5
+            }
+          }}
+        />
       )}
       <Dialog open={openDialog} onClose={() => setOpenDialog(false)}>
         <DialogTitle>重命名</DialogTitle>

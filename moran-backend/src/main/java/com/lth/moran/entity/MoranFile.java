@@ -8,6 +8,7 @@ import jakarta.persistence.Id;
 import jakarta.persistence.JoinColumn;
 import jakarta.persistence.ManyToOne;
 import jakarta.persistence.Table;
+import jakarta.persistence.Transient;
 import lombok.Data;
 
 import java.time.LocalDateTime;
@@ -43,4 +44,10 @@ public class MoranFile {
 
     @Column
     private Boolean isFolder = false;  // True for folders
+
+    @Column(nullable = false, columnDefinition = "boolean default false")
+    private Boolean deleted = false;
+
+    @Transient
+    private Boolean lost = false;  // Transient flag for API response: true if !exists on disk
 }

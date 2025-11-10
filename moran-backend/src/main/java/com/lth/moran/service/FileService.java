@@ -24,6 +24,7 @@ import java.util.List;
 import java.util.Optional;
 import java.util.Queue;
 import java.util.UUID;
+import java.util.stream.Collectors;
 
 @Service
 public class FileService {
@@ -56,12 +57,26 @@ public class FileService {
         if (parentId == null) {
             List<MoranFile> files = fileRepository.findRootFilesByUserId(userId);
             logger.info("Root files count for user {}: {}", userId, files.size());
-            return files;
+            return validateAndMarkLostFiles(files);
         } else {
-            List<MoranFile> files = fileRepository.findByUserIdAndParentIdOrderByNameAsc(userId, parentId);
+            List<MoranFile> files = fileRepository.findByUserIdAndParentIdAndDeletedIsFalseOrderByNameAsc(userId, parentId);
             logger.info("Sub files count for user {} parent {}: {}", userId, parentId, files.size());
-            return files;
+            return validateAndMarkLostFiles(files);
         }
+    }
+
+    private List<MoranFile> validateAndMarkLostFiles(List<MoranFile> files) {
+        return files.stream()
+                .peek(file -> {
+                    if (!file.getDeleted()) {
+                        Path filePath = Paths.get(storagePath, file.getPath());
+                        if (!Files.exists(filePath)) {
+                            logger.warn("File {} does not exist on disk, marking as lost", file.getId());
+                            file.setLost(true);
+                        }
+                    }
+                })
+                .collect(Collectors.toList());
     }
 
     public MoranFile getFileById(Long id) {
@@ -71,6 +86,15 @@ public class FileService {
         if (!file.getUser().getId().equals(userId)) {
             logger.warn("Unauthorized access to file {} by user {}", id, userId);
             throw new RuntimeException("Unauthorized access to file");
+        }
+        if (file.getDeleted()) {
+            throw new RuntimeException("File has been deleted");
+        }
+        Path filePath = Paths.get(storagePath, file.getPath());
+        if (!Files.exists(filePath)) {
+            logger.warn("File {} does not exist on disk, soft deleting", id);
+            softDelete(id);
+            throw new RuntimeException("File not found");
         }
         return file;
     }
@@ -141,8 +165,17 @@ public class FileService {
         return path.toString();
     }
 
+    @Transactional
     public MoranFile createFolder(String folderName, Long parentId) {
         logger.info("Creating folder: {} in parent {}", folderName, parentId);
+        Long userId = getCurrentUserId();
+
+        // Check for existing active folder with same name
+        Optional<MoranFile> existing = fileRepository.findByUserIdAndParentIdAndNameAndDeletedIsFalse(userId, parentId, folderName);
+        if (existing.isPresent()) {
+            throw new RuntimeException("Folder already exists");
+        }
+
         String fullPath = buildFullPath(parentId, folderName);
         Path targetDir = Paths.get(storagePath, fullPath);
         try {
@@ -152,6 +185,7 @@ public class FileService {
             }
         } catch (IOException e) {
             logger.error("Failed to create folder dir: {}", e.getMessage());
+            throw new RuntimeException("Failed to create folder directory", e);
         }
 
         MoranFile folder = new MoranFile();
@@ -177,7 +211,7 @@ public class FileService {
         Long userId = getCurrentUserId();
         while (!queue.isEmpty()) {
             Long currentId = queue.poll();
-            List<MoranFile> children = fileRepository.findByUserIdAndParentIdOrderByNameAsc(userId, currentId);
+            List<MoranFile> children = fileRepository.findByUserIdAndParentIdAndDeletedIsFalseOrderByNameAsc(userId, currentId);
             for (MoranFile child : children) {
                 descendants.add(child);
                 if (child.getIsFolder()) {
@@ -189,13 +223,27 @@ public class FileService {
     }
 
     @Transactional
+    public void softDelete(Long id) {
+        MoranFile file = fileRepository.findById(id).orElse(null);
+        if (file == null || file.getDeleted()) {
+            return;
+        }
+        file.setDeleted(true);
+        fileRepository.save(file);
+        if (!file.getIsFolder() && file.getSize() != null) {
+            Quota quota = quotaRepository.findById(1L).orElseThrow(() -> new RuntimeException("Quota not found"));
+            quota.setUsedSpace(Math.max(0, quota.getUsedSpace() - file.getSize()));
+            quotaRepository.save(quota);
+            logger.info("Soft deleted file {} and updated quota", id);
+        } else {
+            logger.info("Soft deleted folder {}", id);
+        }
+    }
+
+    @Transactional
     public MoranFile renameFile(Long id, String newName) {
         logger.info("Renaming file ID {} to {}", id, newName);
-        MoranFile file = fileRepository.findById(id).orElseThrow(() -> new RuntimeException("File not found"));
-        Long userId = getCurrentUserId();
-        if (!file.getUser().getId().equals(userId)) {
-            throw new RuntimeException("Unauthorized");
-        }
+        MoranFile file = getFileById(id);  // Uses validation
 
         // Prevent empty or invalid name
         if (newName == null || newName.trim().isEmpty()) {
@@ -265,45 +313,55 @@ public class FileService {
 
     public byte[] downloadFile(Long id) throws IOException {
         logger.debug("Downloading file ID: {}", id);
-        MoranFile file = fileRepository.findById(id).orElseThrow(() -> new RuntimeException("File not found"));
+        MoranFile file = getFileById(id);  // Uses validation
         if (file.getIsFolder()) {
             throw new RuntimeException("Cannot download folder");
-        }
-        Long userId = getCurrentUserId();
-        if (!file.getUser().getId().equals(userId)) {
-            throw new RuntimeException("Unauthorized");
         }
         return Files.readAllBytes(Paths.get(storagePath, file.getPath()));
     }
 
+    @Transactional
     public void deleteFile(Long id) throws IOException {
         logger.info("Deleting file ID: {}", id);
-        MoranFile file = fileRepository.findById(id).orElseThrow(() -> new RuntimeException("File not found"));
+        MoranFile file = fileRepository.findById(id).orElseThrow(() -> new RuntimeException("File not found: " + id));
         Long userId = getCurrentUserId();
         if (!file.getUser().getId().equals(userId)) {
             throw new RuntimeException("Unauthorized");
         }
+        if (file.getDeleted()) {
+            throw new RuntimeException("File already deleted");
+        }
 
-        if (file.getIsFolder()) {
-            Path dirPath = Paths.get(storagePath, file.getPath());
-            if (Files.exists(dirPath)) {
-                Files.walk(dirPath).sorted((p1, p2) -> -p1.compareTo(p2)).forEach(p -> {
+        // Physical delete if exists
+        Path filePath = Paths.get(storagePath, file.getPath());
+        boolean existsOnDisk = Files.exists(filePath);
+        if (existsOnDisk) {
+            if (file.getIsFolder()) {
+                Files.walk(filePath).sorted((p1, p2) -> -p1.compareTo(p2)).forEach(p -> {
                     try {
                         Files.delete(p);
                     } catch (IOException e) {
                         logger.error("Failed to delete path: {}", p, e);
                     }
                 });
+                logger.warn("Folder and contents deleted for ID: {}", id);
+            } else {
+                Files.delete(filePath);
+                logger.debug("File physically deleted");
             }
-            logger.warn("Folder and contents deleted for ID: {}", id);
         } else {
-            Quota quota = quotaRepository.findById(1L).orElseThrow(() -> new RuntimeException("Quota not found"));
-            quota.setUsedSpace(Math.max(0, quota.getUsedSpace() - file.getSize()));
-            quotaRepository.save(quota);
-            Files.delete(Paths.get(storagePath, file.getPath()));
-            logger.debug("File deleted and quota updated");
+            logger.warn("File {} already missing on disk", id);
         }
-        fileRepository.delete(file);
+
+        // Soft delete (marks as deleted, adjusts quota)
+        softDelete(id);
+
+        // For folders, hard delete the DB record to release the unique path constraint
+        if (file.getIsFolder()) {
+            fileRepository.delete(file);
+            logger.info("Hard deleted folder record {} to release path constraint", id);
+        }
+
         logger.info("Delete successful: ID {}", id);
     }
 
@@ -317,9 +375,17 @@ public class FileService {
         Long current = id;
         while (current != null) {
             MoranFile parent = fileRepository.findById(current).orElse(null);
-            if (parent != null) {
-                chain.add(0, parent);
-                current = parent.getParentId();
+            if (parent != null && !parent.getDeleted()) {
+                Path parentPath = Paths.get(storagePath, parent.getPath());
+                if (Files.exists(parentPath)) {
+                    chain.add(0, parent);
+                    current = parent.getParentId();
+                } else {
+                    logger.warn("Path chain broken at {}, marking as lost", current);
+                    parent.setLost(true);
+                    chain.add(0, parent);
+                    current = parent.getParentId();  // Continue but mark
+                }
             } else {
                 current = null;
             }

@@ -8,6 +8,8 @@ import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
@@ -40,6 +42,7 @@ public class FileController {
 
     @PostMapping("/folder")
     @PreAuthorize("hasRole('ADMIN')")
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
     public ResponseEntity<MoranFile> createFolder(@RequestBody CreateFolderRequest request) {
         MoranFile folder = fileService.createFolder(request.getName(), request.getParentId());
         return ResponseEntity.ok(folder);
