@@ -1,64 +1,33 @@
-import React, { createContext, useState, useEffect } from 'react';
-import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
-import Login from './components/Login';
-import Dashboard from './components/Dashboard';
-import { axiosInstance } from './utils/api';
+import React from 'react';
+import { createBrowserRouter, RouterProvider } from 'react-router-dom';
+import { routes } from './router/routes';
+import { AuthContext } from './contexts/AuthContext';
+import { useAuthProvider } from './hooks/useAuthProvider';
 
-const AuthContext = createContext();
-
+/**
+ * App - 应用根组件
+ * 功能：
+ *  - 提供全局 AuthContext（useAuthProvider）
+ *  - 挂载 React Router v7
+ */
 function App() {
-  const [user, setUser] = useState(null);
-  const [loading, setLoading] = useState(true);
+  const { user, login, logout, loading } = useAuthProvider();
 
-  useEffect(() => {
-    let token = localStorage.getItem('token');
-    if (!token) {
-      const cookieValue = document.cookie.split('; ').find(row => row.startsWith('jwt='));
-      token = cookieValue ? cookieValue.split('=')[1] : null;
-    }
-    console.log('App init token:', token ? 'found' : 'none');  // Debug token
-    if (token) {
-      axiosInstance.defaults.headers.common['Authorization'] = `Bearer ${token}`;
-      setUser({ token });
-    }
-    setLoading(false);
-  }, []);
+  if (loading) return <div>加载中...</div>;
 
-  const login = (token, rememberMe) => {
-    console.log('Login set token:', token ? 'success' : 'fail');  // Debug
-    setUser({ token });
-    axiosInstance.defaults.headers.common['Authorization'] = `Bearer ${token}`;
-    if (rememberMe) {
-      localStorage.setItem('token', token);
-      document.cookie = `jwt=${token}; max-age=${7*24*60*60}; path=/`;
-    } else {
-      // 非记住我，仅 session
-      localStorage.removeItem('token');
-      document.cookie = `jwt=${token}; path=/`;  // 无 max-age，session 过期
-    }
-  };
-
-  const logout = () => {
-    setUser(null);
-    delete axiosInstance.defaults.headers.common['Authorization'];
-    localStorage.removeItem('token');
-    document.cookie = 'jwt=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;';
-  };
-
-  if (loading) return <div>Loading...</div>;
+  const router = createBrowserRouter(routes, {
+    basename: '/',
+    future: {
+      v7_startTransition: true,
+      v7_relativeSplatPath: true,
+    },
+  });
 
   return (
     <AuthContext.Provider value={{ user, login, logout }}>
-      <Router>
-        <Routes>
-          <Route path="/login" element={!user ? <Login /> : <Navigate to="/dashboard" />} />
-          <Route path="/dashboard/*" element={user ? <Dashboard /> : <Navigate to="/login" />} />
-          <Route path="/" element={<Navigate to={user ? "/dashboard" : "/login"} />} />
-        </Routes>
-      </Router>
+      <RouterProvider router={router} />
     </AuthContext.Provider>
   );
 }
 
 export default App;
-export { AuthContext };

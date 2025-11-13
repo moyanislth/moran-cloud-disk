@@ -1,32 +1,61 @@
 import axios from 'axios';
 
-export const axiosInstance = axios.create({
-  baseURL: 'http://localhost:8080/api',
-  // 移除全局 Content-Type，让 FormData auto multipart
-  headers: {  // 空或只 Accept
-    'Accept': 'application/json, text/plain, */*'
+/**
+ * axiosInstance - 通用 API 客户端
+ * 功能：
+ *  - 动态 baseURL（兼容 Vite）
+ *  - 统一超时与 Accept 头
+ *  - 自动附加 Token
+ *  - 响应拦截统一处理 401（清除凭证 + 重定向登录）
+ *  - 生产模式下关闭日志
+ */
+const axiosInstance = axios.create({
+  baseURL: import.meta.env.MODE === 'production'
+    ? '/api'
+    : 'http://localhost:8080/api',
+  headers: {
+    Accept: 'application/json, text/plain, */*',
   },
+  timeout: 10000,
 });
 
-// Request interceptor
+/** 请求拦截器 - 自动注入 Authorization Token */
 axiosInstance.interceptors.request.use(
   (config) => {
-    console.log('Axios request:', config.method, config.url, 'Headers:', config.headers, 'Content-Type:', config.headers['Content-Type']);
+    const token = localStorage.getItem('token');
+    if (token) {
+      config.headers.Authorization = `Bearer ${token}`;
+    }
+
+    if (import.meta.env.MODE !== 'production') {
+      // 开发环境可选日志
+      console.debug('[API REQUEST]', config.method?.toUpperCase(), config.url);
+    }
     return config;
   },
   (error) => Promise.reject(error)
 );
 
-// Response interceptor
+/** 响应拦截器 - 统一处理错误与登录过期 */
 axiosInstance.interceptors.response.use(
-  response => response,
-  error => {
-    console.error('Axios error:', error.response?.status, error.response?.data);
-    if (error.response?.status === 401) {
+  (response) => response,
+  (error) => {
+    const { status } = error.response || {};
+
+    if (status === 401) {
       localStorage.removeItem('token');
       document.cookie = 'jwt=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;';
-      window.location.href = '/login';
+      if (window.location.pathname !== '/login') {
+        window.location.href = '/login';
+      }
     }
+
+    if (import.meta.env.MODE !== 'production') {
+      console.error('[API ERROR]', status, error.response?.data);
+    }
+
     return Promise.reject(error);
   }
 );
+
+export { axiosInstance };
