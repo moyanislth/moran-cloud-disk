@@ -14,6 +14,7 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.IOException;
+import java.io.OutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -23,8 +24,11 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.Queue;
-import java.util.UUID;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
 
 @Service
 public class FileService {
@@ -83,6 +87,7 @@ public class FileService {
         logger.debug("Getting file by ID: {}", id);
         MoranFile file = fileRepository.findById(id).orElseThrow(() -> new RuntimeException("File not found: " + id));
         Long userId = getCurrentUserId();
+        logger.debug("UserId check: principal={} vs file={}", userId, file.getUser().getId());
         if (!file.getUser().getId().equals(userId)) {
             logger.warn("Unauthorized access to file {} by user {}", id, userId);
             throw new RuntimeException("Unauthorized access to file");
@@ -109,25 +114,28 @@ public class FileService {
             }
 
             String fullPath = buildFullPath(parentId, null);
-            Path dirPath = Paths.get(storagePath, fullPath);
+            String originalName = file.getOriginalFilename();
+            if (originalName == null || originalName.trim().isEmpty()) {
+                throw new RuntimeException("Invalid filename");
+            }
+
+            // Generate unique filename to avoid conflicts
+            String finalName = getUniqueFilename(fullPath, originalName);
+            String filePath = fullPath + "/" + finalName;
+
+            Path targetLocation = Paths.get(storagePath, filePath);
+            Path dirPath = targetLocation.getParent();
             if (!Files.exists(dirPath)) {
                 Files.createDirectories(dirPath);
                 logger.info("Created upload dir: {}", dirPath);
             }
-            String uuid = UUID.randomUUID().toString();
-            String fileExt = Optional.ofNullable(file.getOriginalFilename())
-                    .filter(name -> name.contains("."))
-                    .map(name -> name.substring(name.lastIndexOf(".")))
-                    .orElse("");
-            String filePath = fullPath + "/" + uuid + fileExt;
 
-            Path targetLocation = Paths.get(storagePath, filePath);
             Files.copy(file.getInputStream(), targetLocation, StandardCopyOption.REPLACE_EXISTING);
             logger.debug("File saved to: {}", targetLocation);
 
             MoranFile moranFile = new MoranFile();
-            moranFile.setName(file.getOriginalFilename());
-            moranFile.setPath(filePath);
+            moranFile.setName(originalName);  // Store original name in DB
+            moranFile.setPath(filePath);  // Path uses final (unique) name
             moranFile.setSize(file.getSize());
             moranFile.setMimeType(file.getContentType());
             moranFile.setUser((User) SecurityContextHolder.getContext().getAuthentication().getPrincipal());
@@ -145,6 +153,44 @@ public class FileService {
             logger.error("Upload failed: {}", e.getMessage());
             throw new RuntimeException("Upload failed: " + e.getMessage(), e);
         }
+    }
+
+    private String getUniqueFilename(String fullPath, String originalName) {
+        Path basePath = Paths.get(storagePath, fullPath);
+        String finalName = originalName;
+        int counter = 1;
+        Pattern pattern = Pattern.compile("^(.*) \\((\\d+)\\)([^.]*)\\.([^.]+)$");
+        Matcher matcher = pattern.matcher(originalName);
+
+        String baseName;
+        String extension = "";
+        if (matcher.matches()) {
+            baseName = matcher.group(1);
+            counter = Integer.parseInt(matcher.group(2)) + 1;
+            extension = matcher.group(3) + "." + matcher.group(4);
+        } else {
+            int dotIndex = originalName.lastIndexOf('.');
+            if (dotIndex > 0) {
+                baseName = originalName.substring(0, dotIndex);
+                extension = originalName.substring(dotIndex);
+            } else {
+                baseName = originalName;
+                extension = "";
+            }
+        }
+
+        Path targetPath = basePath.resolve(finalName);
+        while (Files.exists(targetPath) && counter < 100) {  // Prevent infinite loop, max 99 attempts
+            finalName = baseName + " (" + counter + ")" + extension;
+            targetPath = basePath.resolve(finalName);
+            counter++;
+        }
+
+        if (counter >= 100) {
+            throw new RuntimeException("Too many filename conflicts for " + originalName);
+        }
+
+        return finalName;
     }
 
     private String buildFullPath(Long parentId, String finalName) {
@@ -391,5 +437,41 @@ public class FileService {
             }
         }
         return chain;
+    }
+
+    public void zipFolder(Long folderId, OutputStream outputStream) throws IOException {
+        MoranFile folder = getFileById(folderId);
+        if (!folder.getIsFolder()) {
+            throw new RuntimeException("Cannot zip a file");
+        }
+
+        ZipOutputStream zos = new ZipOutputStream(outputStream);
+        try {
+            addToZip(folder, zos, "");  // Start with root folder
+            logger.info("Zipped folder {} successfully", folderId);
+        } finally {
+            zos.close();
+        }
+    }
+
+    private void addToZip(MoranFile file, ZipOutputStream zos, String relativePath) throws IOException {
+        String entryName = relativePath.isEmpty() ? file.getName() + "/" : relativePath + file.getName() + (file.getIsFolder() ? "/" : "");
+        ZipEntry entry = new ZipEntry(entryName);
+        zos.putNextEntry(entry);
+
+        if (file.getIsFolder()) {
+            zos.closeEntry();  // Close empty folder entry
+            List<MoranFile> children = fileRepository.findByUserIdAndParentIdAndDeletedIsFalseOrderByNameAsc(getCurrentUserId(), file.getId());
+            for (MoranFile child : children) {
+                if (!child.getLost() && !child.getDeleted()) {  // Skip lost/deleted
+                    addToZip(child, zos, entryName);
+                }
+            }
+        } else {
+            // Add file content
+            Path filePath = Paths.get(storagePath, file.getPath());
+            Files.copy(filePath, zos);
+            zos.closeEntry();
+        }
     }
 }

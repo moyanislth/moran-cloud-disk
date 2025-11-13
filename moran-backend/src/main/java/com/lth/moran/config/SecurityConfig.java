@@ -2,6 +2,8 @@ package com.lth.moran.config;
 
 import com.lth.moran.filter.JwtAuthenticationFilter;
 import com.lth.moran.util.JwtUtil;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Lazy;
@@ -25,6 +27,8 @@ import java.util.List;
 
 @Configuration
 public class SecurityConfig {
+
+    private static final Logger logger = LoggerFactory.getLogger(SecurityConfig.class);
 
     private final JwtUtil jwtUtil;
     private final UserDetailsService userDetailsService;
@@ -59,7 +63,11 @@ public class SecurityConfig {
                 .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 .authorizeHttpRequests(auth -> auth
                         .requestMatchers(HttpMethod.OPTIONS, "/api/**").permitAll()  // 允许CORS preflight OPTIONS
-                        .requestMatchers("/api/auth/**", "/api/files").permitAll()  // 访客列表
+                        .requestMatchers("/api/auth/**").permitAll()  // Auth endpoints
+                        .requestMatchers(HttpMethod.GET, "/api/files/**").hasAnyRole("ADMIN", "GUEST")  // GET for list/quota/path/preview
+                        .requestMatchers(HttpMethod.POST, "/api/files/**").hasRole("ADMIN")  // Upload/create
+                        .requestMatchers(HttpMethod.PUT, "/api/files/**").hasRole("ADMIN")  // Rename
+                        .requestMatchers(HttpMethod.DELETE, "/api/files/**").hasRole("ADMIN")  // Delete
                         .anyRequest().authenticated()
                 )
                 .addFilterBefore(new JwtAuthenticationFilter(jwtUtil, userDetailsService), UsernamePasswordAuthenticationFilter.class);

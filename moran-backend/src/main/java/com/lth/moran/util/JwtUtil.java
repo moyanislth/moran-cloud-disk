@@ -8,6 +8,7 @@ import io.jsonwebtoken.security.SignatureException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.security.core.GrantedAuthority;
 import org.springframework.security.core.userdetails.UserDetails;
 import org.springframework.stereotype.Component;
 
@@ -20,6 +21,7 @@ import java.util.Date;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.function.Function;
+import java.util.stream.Collectors;
 
 @Component
 public class JwtUtil {
@@ -71,6 +73,11 @@ public class JwtUtil {
 
     public String generateToken(UserDetails userDetails) {
         Map<String, Object> claims = new HashMap<>();
+        // Add role claim for easier extraction
+        String role = userDetails.getAuthorities().stream()
+                .map(GrantedAuthority::getAuthority)
+                .collect(Collectors.joining(","));
+        claims.put("role", role);
         return createToken(claims, userDetails.getUsername());
     }
 
@@ -97,6 +104,11 @@ public class JwtUtil {
         return extractClaim(token, Claims::getSubject);
     }
 
+    /** 提取角色 */
+    public String extractRole(String token) {
+        return extractClaim(token, claims -> claims.get("role", String.class));
+    }
+
     /** 提取过期时间 */
     public Date extractExpiration(String token) {
         return extractClaim(token, Claims::getExpiration);
@@ -116,7 +128,7 @@ public class JwtUtil {
                 logger.warn("Token已过期: {}", userDetails.getUsername());
                 return false;
             }
-            logger.debug("Token validated for user: {}", userDetails.getUsername());
+            logger.debug("Token validated for user: {}, role: {}", userDetails.getUsername(), extractRole(token));
             return true;
         } catch (SignatureException e) {
             logger.error("JWT签名无效: {}", e.getMessage());

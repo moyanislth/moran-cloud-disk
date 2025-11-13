@@ -1,12 +1,14 @@
 import React, { useState, useEffect } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { DataGrid } from '@mui/x-data-grid';
+import { LinearProgress } from '@mui/material';
 import { useDropzone } from 'react-dropzone';
 import { Container, Button, Dialog, DialogTitle, DialogContent, TextField, Alert, Typography, Link, CircularProgress, IconButton, Chip, Box } from '@mui/material';
 import RefreshIcon from '@mui/icons-material/Refresh';
 import DeleteIcon from '@mui/icons-material/Delete';
 import { useAuth } from '../hooks/useAuth';
 import { axiosInstance } from '../utils/api';
+import { saveAs } from 'file-saver';
 
 function FileList({ parentId: propParentId, onFolderClick }) {
   const { user } = useAuth();
@@ -17,6 +19,7 @@ function FileList({ parentId: propParentId, onFolderClick }) {
   const [newName, setNewName] = useState('');
   const [selectedId, setSelectedId] = useState(null);
   const [error, setError] = useState('');
+  const [downloadProgress, setDownloadProgress] = useState({});
 
   useEffect(() => {
     setParentId(propParentId || null);
@@ -119,16 +122,21 @@ function FileList({ parentId: propParentId, onFolderClick }) {
       width: 300, 
       renderCell: (params) => {
         const isLost = params.row.isLost;
+        const handleClick = (e) => {
+          e.preventDefault();
+          if (params.row.isFolder && !isLost) {
+            handleFolderClick(params.row.id);
+          } else if (!params.row.isFolder && !isLost) {
+            // Open preview in new tab
+            const previewUrl = `${axiosInstance.defaults.baseURL}/files/${params.row.id}/preview`;
+            window.open(previewUrl, '_blank');
+          }
+        };
         return (
           <Box sx={{ display: 'flex', alignItems: 'center' }}>
             <Link 
-              href={params.row.isFolder ? `/dashboard/folder/${params.row.id}` : '#'} 
-              onClick={(e) => {
-                if (params.row.isFolder && !isLost) {
-                  handleFolderClick(params.row.id);
-                }
-                e.preventDefault();
-              }}
+              href="#"
+              onClick={handleClick}
               sx={{ opacity: isLost ? 0.5 : 1, cursor: isLost ? 'not-allowed' : 'pointer' }}
             >
               {params.row.isFolder ? '[文件夹]' : ''}{params.value}
@@ -167,24 +175,34 @@ function FileList({ parentId: propParentId, onFolderClick }) {
     {
       field: 'actions',
       headerName: '操作',
-      width: 200,
+      width: 250,
       renderCell: (params) => {
         const isLost = params.row.isLost;
-        const isAdmin = true;  // MVP 单用户，默认 admin，移除 role check
+        const isAdmin = true;  // MVP 单用户，默认 admin
+        const progressKey = `download-${params.row.id}`;
+        const currentProgress = downloadProgress[progressKey] || 0;
         return (
-          <>
+          <Box sx={{ display: 'flex', flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap', gap: 0.5 }}>
             {!isLost && (
               <>
-                <Button size="small" onClick={() => downloadFile(params.row.id)} disabled={isLost}>
-                  下载
-                </Button>
-                <Button 
-                  size="small" 
-                  onClick={() => { setSelectedId(params.row.id); setOpenDialog(true); setNewName(params.row.name); }} 
-                  disabled={isLost}
-                >
-                  重命名
-                </Button>
+                {!params.row.isFolder ? (
+                  <Button size="small" onClick={() => downloadFile(params.row.id, params.row.name)} disabled={isLost}>
+                    下载
+                  </Button>
+                ) : (
+                  <Button size="small" onClick={() => downloadFolderMutation.mutate(params.row.id)} disabled={isLost}>
+                    下载文件夹
+                  </Button>
+                )}
+                {!params.row.isFolder && (
+                  <Button 
+                    size="small" 
+                    onClick={() => { setSelectedId(params.row.id); setOpenDialog(true); setNewName(params.row.name); }} 
+                    disabled={isLost}
+                  >
+                    重命名
+                  </Button>
+                )}
               </>
             )}
             {isAdmin && (
@@ -198,18 +216,60 @@ function FileList({ parentId: propParentId, onFolderClick }) {
                 <DeleteIcon />
               </IconButton>
             )}
-          </>
+            {currentProgress > 0 && (
+              <Box sx={{ width: 100, ml: 1 }}>
+                <LinearProgress variant="determinate" value={currentProgress} />
+                <Typography variant="caption">{currentProgress}%</Typography>
+              </Box>
+            )}
+          </Box>
         );
       }
     }
   ];
 
-  const downloadFile = async (id) => {
-    const link = document.createElement('a');
-    link.href = `${axiosInstance.defaults.baseURL}/files/${id}/download`;
-    link.download = '';
-    link.click();
+  const downloadFile = async (id, fileName) => {
+    try {
+      const response = await axiosInstance.get(`/files/${id}/download`, { responseType: 'blob' });
+      const blob = new Blob([response.data]);
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = fileName || 'download';  // Use file name from params
+      document.body.appendChild(a);
+      a.click();
+      window.URL.revokeObjectURL(url);
+      document.body.removeChild(a);
+    } catch (err) {
+      console.error('Download error:', err);
+      setError(`下载失败: ${err.response?.data?.message || err.message || '未知错误'}`);
+    }
   };
+
+  const downloadFolderMutation = useMutation({
+    mutationFn: (id) => {
+      return axiosInstance.get(`/files/${id}/download-zip`, { 
+        responseType: 'blob',
+        onDownloadProgress: (progressEvent) => {
+          if (progressEvent.total) {
+            const progress = Math.round((progressEvent.loaded * 100) / progressEvent.total);
+            setDownloadProgress(prev => ({ ...prev, [`download-${id}`]: progress }));
+          }
+        }
+      });
+    },
+    onSuccess: (response, id) => {
+      const file = files.find(f => f.id === id);
+      saveAs(response.data, `${file?.name || 'folder'}.zip`);
+      setDownloadProgress(prev => ({ ...prev, [`download-${id}`]: 0 }));
+      setError('');
+    },
+    onError: (err, id) => {
+      console.error('Folder download error:', err);
+      setError(`文件夹下载失败: ${err.response?.data?.message || err.message || '未知错误'}`);
+      setDownloadProgress(prev => ({ ...prev, [`download-${id}`]: 0 }));
+    }
+  });
 
   const deleteMutation = useMutation({
     mutationFn: (id) => axiosInstance.delete(`/files/${id}`),
@@ -252,7 +312,7 @@ function FileList({ parentId: propParentId, onFolderClick }) {
       setQueryVersion(prev => prev + 1);
       refetch();
     },
-    onError: (err) => {
+    onError: () => {
       setError('创建文件夹失败');
       refetch();
       queryClient.invalidateQueries({ queryKey: ['files', parentId] });

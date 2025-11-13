@@ -3,6 +3,8 @@ package com.lth.moran.controller;
 import com.lth.moran.entity.MoranFile;
 import com.lth.moran.entity.Quota;
 import com.lth.moran.service.FileService;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.core.io.ByteArrayResource;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
@@ -13,12 +15,15 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.util.List;
 
 @RestController
 @RequestMapping("/api/files")
 public class FileController {
+
+    private static final Logger logger = LoggerFactory.getLogger(FileController.class);
 
     private final FileService fileService;
 
@@ -27,6 +32,7 @@ public class FileController {
     }
 
     @GetMapping
+    @PreAuthorize("hasAnyRole('ADMIN', 'GUEST')")
     public ResponseEntity<List<MoranFile>> listFiles(@RequestParam(required = false) Long parentId) {
         List<MoranFile> files = fileService.listFiles(parentId);
         return ResponseEntity.ok(files);
@@ -34,10 +40,18 @@ public class FileController {
 
     @PostMapping("/upload")
     @PreAuthorize("hasRole('ADMIN')")
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
     public ResponseEntity<MoranFile> upload(@RequestParam("file") MultipartFile file,
                                             @RequestParam(required = false) Long parentId) throws IOException {
-        MoranFile saved = fileService.uploadFile(file, parentId);
-        return ResponseEntity.ok(saved);
+        logger.debug("Upload request for file: {}, parentId: {}", file.getOriginalFilename(), parentId);
+        try {
+            MoranFile saved = fileService.uploadFile(file, parentId);
+            logger.info("Upload successful: {}", saved.getId());
+            return ResponseEntity.ok(saved);
+        } catch (Exception e) {
+            logger.error("Upload failed: {}", e.getMessage());
+            throw e;  // Transaction will rollback
+        }
     }
 
     @PostMapping("/folder")
@@ -51,16 +65,30 @@ public class FileController {
     @GetMapping("/{id}/download")
     @PreAuthorize("hasRole('ADMIN')")
     public ResponseEntity<ByteArrayResource> download(@PathVariable Long id) throws IOException {
+        MoranFile file = fileService.getFileById(id);  // Validation
         byte[] data = fileService.downloadFile(id);
         ByteArrayResource resource = new ByteArrayResource(data);
         return ResponseEntity.ok()
-                .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + data.length + "\"")
+                .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + file.getName() + "\"")
+                .contentType(MediaType.APPLICATION_OCTET_STREAM)
+                .body(resource);
+    }
+
+    @GetMapping("/{id}/download-zip")
+    @PreAuthorize("hasRole('ADMIN')")
+    public ResponseEntity<ByteArrayResource> downloadFolderZip(@PathVariable Long id) throws IOException {
+        MoranFile folder = fileService.getFileById(id);  // Validation
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        fileService.zipFolder(id, baos);
+        ByteArrayResource resource = new ByteArrayResource(baos.toByteArray());
+        return ResponseEntity.ok()
+                .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + folder.getName() + ".zip\"")
                 .contentType(MediaType.APPLICATION_OCTET_STREAM)
                 .body(resource);
     }
 
     @GetMapping("/{id}/preview")
-    @PreAuthorize("hasRole('ADMIN')")
+    @PreAuthorize("hasAnyRole('ADMIN', 'GUEST')")
     public ResponseEntity<ByteArrayResource> preview(@PathVariable Long id) throws IOException {
         MoranFile file = fileService.getFileById(id);
         if (file.getIsFolder()) {
